@@ -12,10 +12,10 @@ on:
         options:
           - arm64
           - x64
-      electron_branch:
-        description: "Branche/tag Electron (ex: 35-x-y, main)"
+      electron_ref:
+        description: "Branche/tag/commit Electron"
         required: false
-        default: "35-x-y"
+        default: "a2da68124557f306c6f9b0011e74f72884aa4206"
 
 jobs:
   build:
@@ -55,7 +55,7 @@ jobs:
           solutions = [
             {
               "name": "src/electron",
-              "url": "https://github.com/electron/electron@${{ inputs.electron_branch }}",
+              "url": "https://github.com/electron/electron@${{ inputs.electron_ref }}",
               "deps_file": "DEPS",
               "managed": False,
               "custom_vars": {
