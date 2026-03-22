@@ -106,6 +106,14 @@ jobs:
           echo "=== Verify allowlist ==="
           grep -n -A7 "kMimeTypeAllowlist" content/common/pepper_plugin_list.cc
 
+      # ── 5b. Générer packed-refs (manquant avec --no-history) ──
+      - name: Fix git packed-refs
+        working-directory: /tmp/electron-build/src/electron
+        run: |
+          git pack-refs --all
+          ls -la .git/packed-refs
+          head -5 .git/packed-refs
+
       # ── 6. GN gen ──
       - name: GN gen
         working-directory: /tmp/electron-build/src
