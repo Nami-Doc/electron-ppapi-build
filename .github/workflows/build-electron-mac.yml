@@ -13,9 +13,9 @@ on:
           - arm64
           - x64
       electron_branch:
-        description: "Branche/tag Electron (ex: main, v35.0.0)"
+        description: "Branche/tag Electron (ex: 35-x-y, main)"
         required: false
-        default: "main"
+        default: "35-x-y"
 
 jobs:
   build:
