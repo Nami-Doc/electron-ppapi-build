@@ -87,21 +87,24 @@ jobs:
           ls src/electron/ | head -10
         timeout-minutes: 180
 
-      # ── 5. Appliquer le patch PPAPI Flash ──
+      # ── 4b. Checkout du patch depuis ce repo ──
+      - name: Checkout patch file
+        uses: actions/checkout@v4
+        with:
+          path: _repo
+
+      # ── 5. Appliquer le patch PPAPI Flash complet (35 fichiers, proxy+thunks+allowlist) ──
       - name: Apply PPAPI Flash patch
         working-directory: /tmp/electron-build/src
         run: |
-          PATCH_FILE="content/common/pepper_plugin_list.cc"
-
-          echo "=== BEFORE patch ==="
-          grep -n -A6 "kMimeTypeAllowlist" "$PATCH_FILE"
-
-          sed -i '' '/"application\/x-blink-deprecated-test-plugin"/i\
-                      "application/x-shockwave-flash",' "$PATCH_FILE"
-
+          echo "=== Applying full PPAPI Flash patch ==="
+          git apply --stat $GITHUB_WORKSPACE/_repo/ppapi-flash-full.patch
+          git apply --check $GITHUB_WORKSPACE/_repo/ppapi-flash-full.patch
+          git apply $GITHUB_WORKSPACE/_repo/ppapi-flash-full.patch
           echo ""
-          echo "=== AFTER patch ==="
-          grep -n -A7 "kMimeTypeAllowlist" "$PATCH_FILE"
+          echo "=== Patch applied successfully ==="
+          echo "=== Verify allowlist ==="
+          grep -n -A7 "kMimeTypeAllowlist" content/common/pepper_plugin_list.cc
 
       # ── 6. GN gen ──
       - name: GN gen

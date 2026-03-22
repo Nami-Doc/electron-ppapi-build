@@ -1,0 +1,1019 @@
+diff --git a/build/vs_toolchain.py b/build/vs_toolchain.py
+index f0b8bacf57360..dafb379933eef 100755
+--- a/build/vs_toolchain.py
++++ b/build/vs_toolchain.py
+@@ -67,6 +67,7 @@ SDK_VERSION = '10.0.22621.0'
+ # which makes a difference for the arm64 runtime.
+ # The second number is an alternate version number, only used in an error string
+ MSVS_VERSIONS = collections.OrderedDict([
++    ('2025', '18.0'),  # VS 2025 (local install)
+     ('2022', '17.0'),  # The VS version in our packaged toolchain.
+     ('2019', '16.0'),
+     ('2017', '15.0'),
+@@ -75,6 +76,7 @@ MSVS_VERSIONS = collections.OrderedDict([
+ # List of preferred VC toolset version based on MSVS
+ # Order is not relevant for this dictionary.
+ MSVC_TOOLSET_VERSION = {
++    '2025': 'VC145',
+     '2022': 'VC143',
+     '2019': 'VC142',
+     '2017': 'VC141',
+diff --git a/content/browser/plugin_service_impl.cc b/content/browser/plugin_service_impl.cc
+index deae7175f220a..a3b2ace2a0b64 100644
+--- a/content/browser/plugin_service_impl.cc
++++ b/content/browser/plugin_service_impl.cc
+@@ -13,6 +13,8 @@
+ #include "base/command_line.h"
+ #include "base/compiler_specific.h"
+ #include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/path_service.h"
+ #include "base/functional/bind.h"
+ #include "base/location.h"
+ #include "base/logging.h"
+@@ -281,6 +283,7 @@ void PluginServiceImpl::RegisterPlugins() {
+ #else
+   GetContentClient()->AddPlugins(&plugins_);
+ #endif  // BUILDFLAG(ENABLE_PPAPI)
++
+   for (const auto& plugin : plugins_)
+     RegisterInternalPlugin(plugin.ToWebPluginInfo(), /*add_at_beginning=*/true);
+ }
+diff --git a/content/browser/renderer_host/pepper/content_browser_pepper_host_factory.cc b/content/browser/renderer_host/pepper/content_browser_pepper_host_factory.cc
+index 301882846d505..3a52d96bf8ac3 100644
+--- a/content/browser/renderer_host/pepper/content_browser_pepper_host_factory.cc
++++ b/content/browser/renderer_host/pepper/content_browser_pepper_host_factory.cc
+@@ -8,6 +8,7 @@
+ #include <utility>
+ 
+ #include "content/browser/renderer_host/pepper/browser_ppapi_host_impl.h"
++#include "ppapi/host/resource_host.h"
+ #include "content/browser/renderer_host/pepper/pepper_browser_font_singleton_host.h"
+ #include "content/browser/renderer_host/pepper/pepper_file_io_host.h"
+ #include "content/browser/renderer_host/pepper/pepper_file_ref_host.h"
+@@ -208,6 +209,19 @@ ContentBrowserPepperHostFactory::CreateResourceHost(
+         new PepperNetworkMonitorHost(host_, instance, resource));
+   }
+ 
++  // Flash resources - return a generic stub host so the resource creation
++  // succeeds (even though browser-side handlers are no-ops).
++  if (message.type() == PpapiHostMsg_Flash_Create::ID ||
++      message.type() == PpapiHostMsg_FlashClipboard_Create::ID ||
++      message.type() == PpapiHostMsg_FlashFile_Create::ID ||
++      message.type() == PpapiHostMsg_FlashFontFile_Create::ID ||
++      message.type() == PpapiHostMsg_FlashFullscreen_Create::ID ||
++      message.type() == PpapiHostMsg_FlashMenu_Create::ID ||
++      message.type() == PpapiHostMsg_FlashDRM_Create::ID) {
++    return std::make_unique<ppapi::host::ResourceHost>(
++        host_->GetPpapiHost(), instance, resource);
++  }
++
+   return nullptr;
+ }
+ 
+diff --git a/content/browser/renderer_host/plugin_registry_impl.cc b/content/browser/renderer_host/plugin_registry_impl.cc
+index 4174752395675..8062d62da3609 100644
+--- a/content/browser/renderer_host/plugin_registry_impl.cc
++++ b/content/browser/renderer_host/plugin_registry_impl.cc
+@@ -12,6 +12,9 @@
+ #include "content/public/browser/render_process_host.h"
+ #include "content/public/common/content_client.h"
+ #include "content/public/common/webplugininfo.h"
++#include "base/files/file_util.h"
++#include "base/path_service.h"
++#include "base/strings/utf_string_conversions.h"
+ 
+ namespace content {
+ 
+diff --git a/content/common/pepper_plugin_list.cc b/content/common/pepper_plugin_list.cc
+index 496d3ade0962f..8c557187bccc8 100644
+--- a/content/common/pepper_plugin_list.cc
++++ b/content/common/pepper_plugin_list.cc
+@@ -37,6 +37,7 @@ bool IsAllowedFromCommandLine(const ContentPluginInfo& plugin) {
+           "application/x-blink-deprecated-test-plugin",
+           "application/x-blink-test-plugin",
+           "application/x-ppapi-tests",
++          "application/x-shockwave-flash",
+       });
+ 
+   bool allowed = true;
+@@ -175,13 +176,8 @@ bool MakePepperPluginInfo(const WebPluginInfo& webplugin_info,
+ 
+ void ComputePepperPluginList(std::vector<ContentPluginInfo>* plugins) {
+   GetContentClient()->AddPlugins(plugins);
+-  // It would be nice to gate this behind a field trial but this happens too
+-  // early in the startup process. We allow loading from command line for
+-  // testing but don't allow for general use cases.
+-  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
+-          switches::kAllowCommandLinePlugins)) {
+-    ComputePluginsFromCommandLine(plugins);
+-  }
++  // Always allow command-line plugins (PPAPI Flash support)
++  ComputePluginsFromCommandLine(plugins);
+ }
+ 
+ }  // namespace content
+diff --git a/content/ppapi_plugin/ppapi_plugin_main.cc b/content/ppapi_plugin/ppapi_plugin_main.cc
+index b784a1205c232..482052a70457a 100644
+--- a/content/ppapi_plugin/ppapi_plugin_main.cc
++++ b/content/ppapi_plugin/ppapi_plugin_main.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "base/base_paths.h"
+ #include "base/command_line.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
+ #include "base/debug/crash_logging.h"
+ #include "base/debug/debugger.h"
+ #include "base/files/file_path.h"
+@@ -31,6 +33,8 @@
+ #if BUILDFLAG(IS_WIN)
+ #include "base/win/win_util.h"
+ #include "base/win/windows_version.h"
++#include <dbghelp.h>
++#pragma comment(lib, "dbghelp.lib")
+ #include "content/child/dwrite_font_proxy/dwrite_font_proxy_init_impl_win.h"
+ #include "sandbox/win/src/sandbox.h"
+ #include "third_party/blink/public/web/win/web_font_rendering.h"
+@@ -72,6 +76,8 @@ namespace content {
+ int PpapiPluginMain(MainFunctionParams parameters) {
+   const base::CommandLine& command_line = *parameters.command_line;
+ 
++  // DCHECKs will be caught by the SEH handler below
++
+ #if BUILDFLAG(IS_MAC)
+   // Declare that this process has CPU security mitigations enabled (see
+   // PpapiPluginSandboxedProcessLauncherDelegate::EnableCpuSecurityMitigations).
+@@ -178,7 +184,7 @@ int PpapiPluginMain(MainFunctionParams parameters) {
+       subpixel_rendering != gfx::FontRenderParams::SUBPIXEL_RENDERING_NONE);
+ #endif
+ 
+-  run_loop.Run();
++    run_loop.Run();
+ 
+ #if BUILDFLAG(IS_WIN)
+   UninitializeDWriteFontProxy();
+diff --git a/content/ppapi_plugin/ppapi_thread.cc b/content/ppapi_plugin/ppapi_thread.cc
+index 524a2557eeec4..8bcd66ec14830 100644
+--- a/content/ppapi_plugin/ppapi_thread.cc
++++ b/content/ppapi_plugin/ppapi_thread.cc
+@@ -314,6 +314,7 @@ void PpapiThread::OnLoadPlugin(const base::FilePath& path,
+ 
+   int32_t init_error = plugin_entry_points_.initialize_module(
+       local_pp_module_, &ppapi::proxy::PluginDispatcher::GetBrowserInterface);
++
+   if (init_error != PP_OK) {
+     LOG(WARNING) << "InitModule failed with error " << init_error;
+     return;
+diff --git a/content/renderer/pepper/content_renderer_pepper_host_factory.cc b/content/renderer/pepper/content_renderer_pepper_host_factory.cc
+index 670a243553027..2204bfa22a49b 100644
+--- a/content/renderer/pepper/content_renderer_pepper_host_factory.cc
++++ b/content/renderer/pepper/content_renderer_pepper_host_factory.cc
+@@ -174,6 +174,12 @@ ContentRendererPepperHostFactory::CreateResourceHost(
+     return camera_host->Init() ? std::move(camera_host) : nullptr;
+   }
+ 
++  // Flash resources - return a generic stub host for renderer-side
++  if (message.type() == PpapiHostMsg_Flash_Create::ID) {
++    return std::make_unique<ppapi::host::ResourceHost>(
++        host_->GetPpapiHost(), instance, resource);
++  }
++
+   return nullptr;
+ }
+ 
+diff --git a/content/renderer/pepper/pepper_in_process_resource_creation.cc b/content/renderer/pepper/pepper_in_process_resource_creation.cc
+index bacef52df77a1..be30536ea6b8a 100644
+--- a/content/renderer/pepper/pepper_in_process_resource_creation.cc
++++ b/content/renderer/pepper/pepper_in_process_resource_creation.cc
+@@ -148,4 +148,27 @@ PP_Resource PepperInProcessResourceCreation::CreateWebSocket(
+               instance))->GetReference();
+ }
+ 
++PP_Resource PepperInProcessResourceCreation::CreateFlashDRM(
++    PP_Instance instance) {
++  return 0;
++}
++
++PP_Resource PepperInProcessResourceCreation::CreateFlashFontFile(
++    PP_Instance instance,
++    const PP_BrowserFont_Trusted_Description* description,
++    PP_PrivateFontCharset charset) {
++  return 0;
++}
++
++PP_Resource PepperInProcessResourceCreation::CreateFlashMenu(
++    PP_Instance instance,
++    const PP_Flash_Menu* menu_data) {
++  return 0;
++}
++
++PP_Resource PepperInProcessResourceCreation::CreateFlashMessageLoop(
++    PP_Instance instance) {
++  return 0;
++}
++
+ }  // namespace content
+diff --git a/content/renderer/pepper/pepper_in_process_resource_creation.h b/content/renderer/pepper/pepper_in_process_resource_creation.h
+index 2b07f42fb35e5..4edc3dcd6e98f 100644
+--- a/content/renderer/pepper/pepper_in_process_resource_creation.h
++++ b/content/renderer/pepper/pepper_in_process_resource_creation.h
+@@ -6,6 +6,9 @@
+ #define CONTENT_RENDERER_PEPPER_PEPPER_IN_PROCESS_RESOURCE_CREATION_H_
+ 
+ #include "base/memory/raw_ptr.h"
++#include "ppapi/c/private/pp_private_font_charset.h"
++
++struct PP_Flash_Menu;
+ #include "content/renderer/pepper/resource_creation_impl.h"
+ #include "ppapi/proxy/connection.h"
+ 
+@@ -66,6 +69,16 @@ class PepperInProcessResourceCreation : public ResourceCreationImpl {
+   PP_Resource CreateURLRequestInfo(PP_Instance instance) override;
+   PP_Resource CreateWebSocket(PP_Instance instance) override;
+ 
++  // Flash resource stubs (not supported in-process)
++  PP_Resource CreateFlashDRM(PP_Instance instance) override;
++  PP_Resource CreateFlashFontFile(
++      PP_Instance instance,
++      const PP_BrowserFont_Trusted_Description* description,
++      PP_PrivateFontCharset charset) override;
++  PP_Resource CreateFlashMenu(PP_Instance instance,
++                              const PP_Flash_Menu* menu_data) override;
++  PP_Resource CreateFlashMessageLoop(PP_Instance instance) override;
++
+  private:
+   // Non-owning pointer to the host for the current plugin.
+   raw_ptr<RendererPpapiHostImpl> host_impl_;
+diff --git a/content/renderer/pepper/pepper_plugin_instance_impl.cc b/content/renderer/pepper/pepper_plugin_instance_impl.cc
+index 5acb281f227fc..9d7d637f41cac 100644
+--- a/content/renderer/pepper/pepper_plugin_instance_impl.cc
++++ b/content/renderer/pepper/pepper_plugin_instance_impl.cc
+@@ -2125,6 +2125,10 @@ ppapi::Resource* PepperPluginInstanceImpl::GetSingletonResource(
+     case ppapi::BROWSER_FONT_SINGLETON_ID:
+     case ppapi::ISOLATED_FILESYSTEM_SINGLETON_ID:
+     case ppapi::NETWORK_PROXY_SINGLETON_ID:
++    case ppapi::FLASH_CLIPBOARD_SINGLETON_ID:
++    case ppapi::FLASH_FILE_SINGLETON_ID:
++    case ppapi::FLASH_FULLSCREEN_SINGLETON_ID:
++    case ppapi::FLASH_SINGLETON_ID:
+       NOTIMPLEMENTED();
+       return nullptr;
+     case ppapi::GAMEPAD_SINGLETON_ID:
+diff --git a/ppapi/BUILD.gn b/ppapi/BUILD.gn
+index c2a4ff3335cc7..644247468d253 100644
+--- a/ppapi/BUILD.gn
++++ b/ppapi/BUILD.gn
+@@ -15,9 +15,8 @@ if (is_mac) {
+ 
+ assert(enable_ppapi)
+ 
+-# PPAPI is not supported (e.g. there is no effective sandbox) and must not be
+-# shipped for Chrome on Windows.
+-assert(!(is_win && is_official_build))
++# PPAPI assertion disabled for Electron Flash support
++# assert(!(is_win && is_official_build))
+ 
+ # Test files shared between several targets below.
+ #
+diff --git a/ppapi/proxy/BUILD.gn b/ppapi/proxy/BUILD.gn
+index fc97758faa01f..34c456cdc6113 100644
+--- a/ppapi/proxy/BUILD.gn
++++ b/ppapi/proxy/BUILD.gn
+@@ -74,6 +74,24 @@ component("proxy") {
+     "plugin_array_buffer_var.cc",
+     "plugin_array_buffer_var.h",
+     "plugin_dispatcher.cc",
++    "flash_clipboard_resource.cc",
++    "flash_clipboard_resource.h",
++    "flash_drm_resource.cc",
++    "flash_drm_resource.h",
++    "flash_file_resource.cc",
++    "flash_file_resource.h",
++    "flash_font_file_resource.cc",
++    "flash_font_file_resource.h",
++    "flash_fullscreen_resource.cc",
++    "flash_fullscreen_resource.h",
++    "flash_menu_resource.cc",
++    "flash_menu_resource.h",
++    "flash_resource.cc",
++    "flash_resource.h",
++    "ppb_flash_message_loop_proxy.cc",
++    "ppb_flash_message_loop_proxy.h",
++    "serialized_flash_menu.cc",
++    "serialized_flash_menu.h",
+     "plugin_globals.cc",
+     "plugin_globals.h",
+     "plugin_message_filter.cc",
+diff --git a/ppapi/proxy/ppapi_messages.h b/ppapi/proxy/ppapi_messages.h
+index f7fa5ed9002a3..bd9ec5d6dbedd 100644
+--- a/ppapi/proxy/ppapi_messages.h
++++ b/ppapi/proxy/ppapi_messages.h
+@@ -85,6 +85,11 @@
+ #include "ppapi/shared_impl/url_request_info_data.h"
+ #include "ppapi/shared_impl/url_response_info_data.h"
+ 
++#include "ppapi/c/private/ppb_flash.h"
++#include "ppapi/c/private/ppp_flash_browser_operations.h"
++#include "ppapi/proxy/serialized_flash_menu.h"
++#include "ppapi/shared_impl/ppp_flash_browser_operations_shared.h"
++
+ #undef IPC_MESSAGE_EXPORT
+ #define IPC_MESSAGE_EXPORT PPAPI_PROXY_EXPORT
+ 
+@@ -128,6 +133,13 @@ IPC_ENUM_TRAITS_MIN_MAX_VALUE(PP_VideoDecoder_Profile,
+ IPC_ENUM_TRAITS_MAX_VALUE(PP_VideoFrame_Format, PP_VIDEOFRAME_FORMAT_LAST)
+ IPC_ENUM_TRAITS_MAX_VALUE(PP_HardwareAcceleration, PP_HARDWAREACCELERATION_LAST)
+ IPC_ENUM_TRAITS_MAX_VALUE(PP_VideoProfile, PP_VIDEOPROFILE_MAX)
++IPC_ENUM_TRAITS_MAX_VALUE(PP_Flash_BrowserOperations_Permission,
++                          PP_FLASH_BROWSEROPERATIONS_PERMISSION_LAST)
++IPC_ENUM_TRAITS_MAX_VALUE(PP_Flash_BrowserOperations_SettingType,
++                          PP_FLASH_BROWSEROPERATIONS_SETTINGTYPE_LAST)
++IPC_ENUM_TRAITS_MIN_MAX_VALUE(PP_FlashSetting,
++                              PP_FLASHSETTING_FIRST,
++                              PP_FLASHSETTING_LAST)
+ 
+ IPC_STRUCT_TRAITS_BEGIN(PP_Point)
+   IPC_STRUCT_TRAITS_MEMBER(x)
+@@ -382,6 +394,11 @@ IPC_STRUCT_TRAITS_BEGIN(ppapi::proxy::SerializedNetworkInfo)
+   IPC_STRUCT_TRAITS_MEMBER(mtu)
+ IPC_STRUCT_TRAITS_END()
+ 
++IPC_STRUCT_TRAITS_BEGIN(ppapi::FlashSiteSetting)
++  IPC_STRUCT_TRAITS_MEMBER(site)
++  IPC_STRUCT_TRAITS_MEMBER(permission)
++IPC_STRUCT_TRAITS_END()
++
+ // Only whitelisted switches passed through PpapiNaClPluginArgs.
+ // The list of switches can be found in:
+ //   components/nacl/browser/nacl_process_host.cc
+@@ -411,6 +428,21 @@ IPC_STRUCT_TRAITS_MEMBER(buffer_preserved)
+ IPC_STRUCT_TRAITS_MEMBER(single_buffer)
+ IPC_STRUCT_TRAITS_END()
+ 
++IPC_STRUCT_TRAITS_BEGIN(ppapi::proxy::PPBFlash_DrawGlyphs_Params)
++  IPC_STRUCT_TRAITS_MEMBER(instance)
++  IPC_STRUCT_TRAITS_MEMBER(image_data)
++  IPC_STRUCT_TRAITS_MEMBER(font_desc)
++  IPC_STRUCT_TRAITS_MEMBER(color)
++  IPC_STRUCT_TRAITS_MEMBER(position)
++  IPC_STRUCT_TRAITS_MEMBER(clip)
++  IPC_STRUCT_TRAITS_MEMBER(transformation)
++  IPC_STRUCT_TRAITS_MEMBER(allow_subpixel_aa)
++  IPC_STRUCT_TRAITS_MEMBER(glyph_indices)
++  IPC_STRUCT_TRAITS_MEMBER(glyph_advances)
++IPC_STRUCT_TRAITS_END()
++
++// SerializedFlashMenu ParamTraits is in ppapi_param_traits.h
++
+ // These are from the browser to the plugin.
+ // Loads the given plugin.
+ IPC_MESSAGE_CONTROL2(PpapiMsg_LoadPlugin,
+@@ -464,6 +496,67 @@ IPC_SYNC_MESSAGE_CONTROL1_1(PpapiMsg_SupportsInterface,
+ IPC_MESSAGE_CONTROL1(PpapiMsg_SetNetworkState,
+                      bool /* online */)
+ 
++// Flash Browser Operations ----------------------------------------------------
++// Requests a list of sites that have data stored from the plugin. The plugin
++// process will respond with PpapiHostMsg_GetSitesWithDataResult. This is used
++// for Flash.
++IPC_MESSAGE_CONTROL2(PpapiMsg_GetSitesWithData,
++                     uint32_t /* request_id */,
++                     base::FilePath /* plugin_data_path */)
++IPC_MESSAGE_CONTROL2(PpapiHostMsg_GetSitesWithDataResult,
++                     uint32_t /* request_id */,
++                     std::vector<std::string> /* sites */)
++
++// Instructs the plugin to clear data for the given site & time. The plugin
++// process will respond with PpapiHostMsg_ClearSiteDataResult. This is used
++// for Flash.
++IPC_MESSAGE_CONTROL5(PpapiMsg_ClearSiteData,
++                     uint32_t /* request_id */,
++                     base::FilePath /* plugin_data_path */,
++                     std::string /* site */,
++                     uint64_t /* flags */,
++                     uint64_t /* max_age */)
++IPC_MESSAGE_CONTROL2(PpapiHostMsg_ClearSiteDataResult,
++                     uint32_t /* request_id */,
++                     bool /* success */)
++
++IPC_MESSAGE_CONTROL2(PpapiMsg_DeauthorizeContentLicenses,
++                     uint32_t /* request_id */,
++                     base::FilePath /* plugin_data_path */)
++IPC_MESSAGE_CONTROL2(PpapiHostMsg_DeauthorizeContentLicensesResult,
++                     uint32_t /* request_id */,
++                     bool /* success */)
++
++IPC_MESSAGE_CONTROL3(PpapiMsg_GetPermissionSettings,
++                     uint32_t /* request_id */,
++                     base::FilePath /* plugin_data_path */,
++                     PP_Flash_BrowserOperations_SettingType /* setting_type */)
++IPC_MESSAGE_CONTROL4(
++    PpapiHostMsg_GetPermissionSettingsResult,
++    uint32_t /* request_id */,
++    bool /* success */,
++    PP_Flash_BrowserOperations_Permission /* default_permission */,
++    ppapi::FlashSiteSettings /* sites */)
++
++IPC_MESSAGE_CONTROL5(PpapiMsg_SetDefaultPermission,
++                     uint32_t /* request_id */,
++                     base::FilePath /* plugin_data_path */,
++                     PP_Flash_BrowserOperations_SettingType /* setting_type */,
++                     PP_Flash_BrowserOperations_Permission /* permission */,
++                     bool /* clear_site_specific */)
++IPC_MESSAGE_CONTROL2(PpapiHostMsg_SetDefaultPermissionResult,
++                     uint32_t /* request_id */,
++                     bool /* success */)
++
++IPC_MESSAGE_CONTROL4(PpapiMsg_SetSitePermission,
++                     uint32_t /* request_id */,
++                     base::FilePath /* plugin_data_path */,
++                     PP_Flash_BrowserOperations_SettingType /* setting_type */,
++                     ppapi::FlashSiteSettings /* sites */)
++IPC_MESSAGE_CONTROL2(PpapiHostMsg_SetSitePermissionResult,
++                     uint32_t /* request_id */,
++                     bool /* success */)
++
+ #endif  // !BUILDFLAG(IS_NACL)
+ 
+ // PPB_Audio.
+@@ -1830,4 +1923,179 @@ IPC_MESSAGE_CONTROL1(PpapiPluginMsg_VideoCapture_OnBufferReady,
+ 
+ #endif  // !BUILDFLAG(IS_NACL)
+ 
++// Flash -----------------------------------------------------------------------
++
++IPC_MESSAGE_CONTROL0(PpapiHostMsg_Flash_Create)
++
++// Message to notify the browser to register an update in system activity.
++IPC_MESSAGE_CONTROL0(PpapiHostMsg_Flash_UpdateActivity)
++
++// Query the browser for the proxy server to use for the given URL.
++IPC_MESSAGE_CONTROL1(PpapiHostMsg_Flash_GetProxyForURL, std::string /* url */)
++// Reply message for GetProxyForURL containing the proxy server.
++IPC_MESSAGE_CONTROL1(PpapiPluginMsg_Flash_GetProxyForURLReply,
++                     std::string /* proxy */)
++
++// Queries the browser for the local time zone offset for a given time.
++IPC_MESSAGE_CONTROL1(PpapiHostMsg_Flash_GetLocalTimeZoneOffset,
++                     base::Time /* time */)
++// Reply to GetLocalTimeZoneOffset containing the time zone offset as a double.
++IPC_MESSAGE_CONTROL1(PpapiPluginMsg_Flash_GetLocalTimeZoneOffsetReply,
++                     double /* offset */)
++
++// Query the browser for the restrictions on storing Flash LSOs.
++IPC_MESSAGE_CONTROL0(PpapiHostMsg_Flash_GetLocalDataRestrictions)
++// Reply message for GetLocalDataRestrictions containing the restrictions to
++// use. These are PP_FlashLSORestrictions cast to an int32_t.
++IPC_MESSAGE_CONTROL1(PpapiPluginMsg_Flash_GetLocalDataRestrictionsReply,
++                     int32_t /* restrictions */)
++
++// Notifies the renderer whether the Flash instance is in windowed mode. No
++// reply is sent.
++IPC_MESSAGE_CONTROL1(PpapiHostMsg_Flash_SetInstanceAlwaysOnTop,
++                     bool /* on_top */)
++
++// Notifies the renderer to draw text to the given PP_ImageData resource. All
++// parmeters for drawing (including the resource to draw to) are contianed in
++// the PPBFlash_DrawGlyphs_Params structure. An error code is sent in a reply
++// message indicating success.
++IPC_MESSAGE_CONTROL1(PpapiHostMsg_Flash_DrawGlyphs,
++                     ppapi::proxy::PPBFlash_DrawGlyphs_Params /* params */)
++
++// Notifies the renderer to navigate to the given URL contained in the
++// URLRequestInfoData. An error code is sent in a reply message indicating
++// success.
++IPC_MESSAGE_CONTROL3(PpapiHostMsg_Flash_Navigate,
++                     ppapi::URLRequestInfoData /* data */,
++                     std::string /* target */,
++                     bool /* from_user_action */)
++
++// Queries the renderer on whether the plugin instance is the topmost element
++// in the area of the instance specified by the given PP_Rect. PP_OK is sent as
++// the error code in a reply message if the rect is topmost otherwise
++// PP_ERROR_FAILED is sent.
++IPC_MESSAGE_CONTROL1(PpapiHostMsg_Flash_IsRectTopmost,
++                     PP_Rect /* rect */)
++
++// Notifies the renderer to invoke printing for the given plugin instance. No
++// reply is sent.
++IPC_MESSAGE_CONTROL0(PpapiHostMsg_Flash_InvokePrinting)
++
++// Flash clipboard.
++IPC_MESSAGE_CONTROL0(PpapiHostMsg_FlashClipboard_Create)
++IPC_MESSAGE_CONTROL1(PpapiHostMsg_FlashClipboard_RegisterCustomFormat,
++                     std::string /* format_name */)
++IPC_MESSAGE_CONTROL1(PpapiPluginMsg_FlashClipboard_RegisterCustomFormatReply,
++                     uint32_t /* format */)
++IPC_MESSAGE_CONTROL2(PpapiHostMsg_FlashClipboard_IsFormatAvailable,
++                     uint32_t /* clipboard_type */,
++                     uint32_t /* format */)
++IPC_MESSAGE_CONTROL2(PpapiHostMsg_FlashClipboard_ReadData,
++                     uint32_t /* clipboard_type */,
++                     uint32_t /* format */)
++IPC_MESSAGE_CONTROL1(PpapiPluginMsg_FlashClipboard_ReadDataReply,
++                     std::string /* result */)
++IPC_MESSAGE_CONTROL3(PpapiHostMsg_FlashClipboard_WriteData,
++                     uint32_t /* clipboard_type */,
++                     std::vector<uint32_t> /* formats */,
++                     std::vector<std::string> /* data */)
++IPC_MESSAGE_CONTROL1(PpapiHostMsg_FlashClipboard_GetSequenceNumber,
++                     uint32_t /* clipboard_type */)
++IPC_MESSAGE_CONTROL1(PpapiPluginMsg_FlashClipboard_GetSequenceNumberReply,
++                     uint64_t /* sequence_number */)
++
++// Flash DRM.
++IPC_MESSAGE_CONTROL0(PpapiHostMsg_FlashDRM_Create)
++
++// Requests the device ID.
++IPC_MESSAGE_CONTROL0(PpapiHostMsg_FlashDRM_GetDeviceID)
++// Reply for GetDeviceID which includes the device ID as a string.
++IPC_MESSAGE_CONTROL1(PpapiPluginMsg_FlashDRM_GetDeviceIDReply,
++                     std::string /* id */)
++
++// Requests the HMONITOR corresponding to the monitor on which the instance is
++// displayed.
++IPC_MESSAGE_CONTROL0(PpapiHostMsg_FlashDRM_GetHmonitor)
++// Reply message for GetHmonitor which contains the HMONITOR as an int64_t.
++IPC_MESSAGE_CONTROL1(PpapiPluginMsg_FlashDRM_GetHmonitorReply,
++                     int64_t /* hmonitor */)
++
++// Requests the voucher file which is used to verify the integrity of the Flash
++// module. A PPB_FileRef resource will be created.
++IPC_MESSAGE_CONTROL0(PpapiHostMsg_FlashDRM_GetVoucherFile)
++// Reply message for GetVoucherFile which contains the CreateInfo for a
++// PPB_FileRef which points to the voucher file.
++IPC_MESSAGE_CONTROL1(PpapiPluginMsg_FlashDRM_GetVoucherFileReply,
++                     ppapi::FileRefCreateInfo /* file_info */)
++
++// Requests a value indicating whether the monitor on which the instance is
++// displayed is external.
++IPC_MESSAGE_CONTROL0(PpapiHostMsg_FlashDRM_MonitorIsExternal)
++// Reply message for MonitorIsExternal which contains the value indicating if
++// the monitor is external.
++IPC_MESSAGE_CONTROL1(PpapiPluginMsg_FlashDRM_MonitorIsExternalReply,
++                     PP_Bool /* is_external */)
++
++// Flash file.
++IPC_MESSAGE_CONTROL0(PpapiHostMsg_FlashFile_Create)
++IPC_MESSAGE_CONTROL2(PpapiHostMsg_FlashFile_OpenFile,
++                     ppapi::PepperFilePath /* path */,
++                     int /* pp_open_flags */)
++IPC_MESSAGE_CONTROL2(PpapiHostMsg_FlashFile_RenameFile,
++                     ppapi::PepperFilePath /* from_path */,
++                     ppapi::PepperFilePath /* to_path */)
++IPC_MESSAGE_CONTROL2(PpapiHostMsg_FlashFile_DeleteFileOrDir,
++                     ppapi::PepperFilePath /* path */,
++                     bool /* recursive */)
++IPC_MESSAGE_CONTROL1(PpapiHostMsg_FlashFile_CreateDir,
++                     ppapi::PepperFilePath /* path */)
++IPC_MESSAGE_CONTROL1(PpapiHostMsg_FlashFile_QueryFile,
++                     ppapi::PepperFilePath /* path */)
++IPC_MESSAGE_CONTROL1(PpapiPluginMsg_FlashFile_QueryFileReply,
++                     base::File::Info /* file_info */)
++IPC_MESSAGE_CONTROL1(PpapiHostMsg_FlashFile_GetDirContents,
++                     ppapi::PepperFilePath /* path */)
++IPC_MESSAGE_CONTROL1(PpapiPluginMsg_FlashFile_GetDirContentsReply,
++                     ppapi::DirContents /* entries */)
++IPC_MESSAGE_CONTROL0(PpapiHostMsg_FlashFile_CreateTemporaryFile)
++
++// Flash font file.
++IPC_MESSAGE_CONTROL2(PpapiHostMsg_FlashFontFile_Create,
++                     ppapi::proxy::SerializedFontDescription /* description */,
++                     PP_PrivateFontCharset /* charset */)
++IPC_MESSAGE_CONTROL1(PpapiHostMsg_FlashFontFile_GetFontTable,
++                     uint32_t /* table */)
++IPC_MESSAGE_CONTROL1(PpapiPluginMsg_FlashFontFile_GetFontTableReply,
++                     std::string /* output */)
++
++// Flash fullscreen.
++IPC_MESSAGE_CONTROL0(PpapiHostMsg_FlashFullscreen_Create)
++IPC_MESSAGE_CONTROL1(PpapiHostMsg_FlashFullscreen_SetFullscreen,
++                     bool /* fullscreen */)
++
++// FlashMenu.
++
++// Creates the flash menu with the given data.
++IPC_MESSAGE_CONTROL1(PpapiHostMsg_FlashMenu_Create,
++                     ppapi::proxy::SerializedFlashMenu /* menu_data */)
++
++// Shows the menu at the given location relative to the plugin instance.
++IPC_MESSAGE_CONTROL1(PpapiHostMsg_FlashMenu_Show,
++                     PP_Point /* location */)
++
++// Reply to a show command. If the resource reply is PP_OK, the selected_id
++// will be the menu item ID chosen by the user.
++IPC_MESSAGE_CONTROL1(PpapiPluginMsg_FlashMenu_ShowReply,
++                     int32_t /* selected_id */)
++
++// PPB_Flash_MessageLoop.
++IPC_SYNC_MESSAGE_ROUTED1_1(PpapiHostMsg_PPBFlashMessageLoop_Create,
++                           PP_Instance /* instance */,
++                           ppapi::HostResource /* result */)
++IPC_SYNC_MESSAGE_ROUTED1_1(PpapiHostMsg_PPBFlashMessageLoop_Run,
++                           ppapi::HostResource /* flash_message_loop */,
++                           int32_t /* result */)
++IPC_SYNC_MESSAGE_ROUTED1_0(PpapiHostMsg_PPBFlashMessageLoop_Quit,
++                           ppapi::HostResource /* flash_message_loop */)
++
+ #endif  // PPAPI_PROXY_PPAPI_MESSAGES_H_
+diff --git a/ppapi/proxy/ppapi_param_traits.h b/ppapi/proxy/ppapi_param_traits.h
+index c9cb81ff2c5d9..ed80c099f8217 100644
+--- a/ppapi/proxy/ppapi_param_traits.h
++++ b/ppapi/proxy/ppapi_param_traits.h
+@@ -15,6 +15,7 @@
+ #include "ppapi/c/pp_rect.h"
+ #include "ppapi/c/pp_var.h"
+ #include "ppapi/proxy/ppapi_proxy_export.h"
++#include "ppapi/proxy/serialized_flash_menu.h"
+ #include "ppapi/shared_impl/file_path.h"
+ #include "ppapi/shared_impl/file_ref_create_info.h"
+ #include "ppapi/shared_impl/media_stream_video_track_shared.h"
+@@ -176,6 +177,21 @@ struct PPAPI_PROXY_EXPORT ParamTraits<ppapi::SocketOptionData> {
+   static void Log(const param_type& p, std::string* l);
+ };
+ 
++// Flash SerializedFlashMenu custom ParamTraits
++template <>
++struct ParamTraits<ppapi::proxy::SerializedFlashMenu> {
++  typedef ppapi::proxy::SerializedFlashMenu param_type;
++  static void Write(base::Pickle* m, const param_type& p) {
++    p.WriteToMessage(m);
++  }
++  static bool Read(const base::Pickle* m,
++                   base::PickleIterator* iter,
++                   param_type* r) {
++    return r->ReadFromMessage(m, iter);
++  }
++  static void Log(const param_type& p, std::string* l) {}
++};
++
+ }  // namespace IPC
+ 
+ #endif  // PPAPI_PROXY_PPAPI_PARAM_TRAITS_H_
+diff --git a/ppapi/proxy/ppb_instance_proxy.cc b/ppapi/proxy/ppb_instance_proxy.cc
+index 3cac80abf82d4..39ad624326886 100644
+--- a/ppapi/proxy/ppb_instance_proxy.cc
++++ b/ppapi/proxy/ppb_instance_proxy.cc
+@@ -20,6 +20,10 @@
+ #include "ppapi/c/ppb_messaging.h"
+ #include "ppapi/c/ppb_mouse_lock.h"
+ #include "ppapi/proxy/browser_font_singleton_resource.h"
++#include "ppapi/proxy/flash_clipboard_resource.h"
++#include "ppapi/proxy/flash_file_resource.h"
++#include "ppapi/proxy/flash_fullscreen_resource.h"
++#include "ppapi/proxy/flash_resource.h"
+ #include "ppapi/proxy/enter_proxy.h"
+ #include "ppapi/proxy/gamepad_resource.h"
+ #include "ppapi/proxy/host_dispatcher.h"
+@@ -327,8 +331,26 @@ Resource* PPB_Instance_Proxy::GetSingletonResource(PP_Instance instance,
+     case BROWSER_FONT_SINGLETON_ID:
+       new_singleton = new BrowserFontSingletonResource(connection, instance);
+       break;
++    case FLASH_CLIPBOARD_SINGLETON_ID:
++      new_singleton = new FlashClipboardResource(connection, instance);
++      break;
++    case FLASH_FILE_SINGLETON_ID:
++      new_singleton = new FlashFileResource(connection, instance);
++      break;
++    case FLASH_FULLSCREEN_SINGLETON_ID:
++      new_singleton = new FlashFullscreenResource(connection, instance);
++      break;
++    case FLASH_SINGLETON_ID:
++      new_singleton = new FlashResource(
++          connection, instance,
++          static_cast<PluginDispatcher*>(dispatcher()));
++      break;
+ #else
+     case BROWSER_FONT_SINGLETON_ID:
++    case FLASH_CLIPBOARD_SINGLETON_ID:
++    case FLASH_FILE_SINGLETON_ID:
++    case FLASH_FULLSCREEN_SINGLETON_ID:
++    case FLASH_SINGLETON_ID:
+       NOTREACHED();
+ #endif  // !BUILDFLAG(IS_NACL)
+   }
+diff --git a/ppapi/proxy/resource_creation_proxy.cc b/ppapi/proxy/resource_creation_proxy.cc
+index b03a24b2a8c23..1a06bf6fe4172 100644
+--- a/ppapi/proxy/resource_creation_proxy.cc
++++ b/ppapi/proxy/resource_creation_proxy.cc
+@@ -11,6 +11,9 @@
+ #include "ppapi/proxy/audio_output_resource.h"
+ #include "ppapi/proxy/camera_device_resource.h"
+ #include "ppapi/proxy/connection.h"
++#include "ppapi/proxy/flash_drm_resource.h"
++#include "ppapi/proxy/flash_font_file_resource.h"
++#include "ppapi/proxy/flash_menu_resource.h"
+ #include "ppapi/proxy/file_chooser_resource.h"
+ #include "ppapi/proxy/file_io_resource.h"
+ #include "ppapi/proxy/file_ref_resource.h"
+@@ -26,6 +29,7 @@
+ #include "ppapi/proxy/plugin_resource_tracker.h"
+ #include "ppapi/proxy/ppapi_messages.h"
+ #include "ppapi/proxy/ppb_audio_proxy.h"
++#include "ppapi/proxy/ppb_flash_message_loop_proxy.h"
+ #include "ppapi/proxy/ppb_buffer_proxy.h"
+ #include "ppapi/proxy/ppb_graphics_3d_proxy.h"
+ #include "ppapi/proxy/ppb_image_data_proxy.h"
+@@ -45,6 +49,7 @@
+ #include "ppapi/proxy/video_encoder_resource.h"
+ #include "ppapi/proxy/vpn_provider_resource.h"
+ #include "ppapi/proxy/websocket_resource.h"
++#include "ppapi/c/private/ppb_flash_menu.h"
+ #include "ppapi/shared_impl/api_id.h"
+ #include "ppapi/shared_impl/host_resource.h"
+ #include "ppapi/shared_impl/ppb_audio_config_shared.h"
+@@ -413,6 +418,29 @@ PP_Resource ResourceCreationProxy::CreateVideoCapture(PP_Instance instance) {
+       ->GetReference();
+ }
+ 
++PP_Resource ResourceCreationProxy::CreateFlashDRM(PP_Instance instance) {
++  return (new FlashDRMResource(GetConnection(), instance))->GetReference();
++}
++
++PP_Resource ResourceCreationProxy::CreateFlashFontFile(
++    PP_Instance instance,
++    const PP_BrowserFont_Trusted_Description* description,
++    PP_PrivateFontCharset charset) {
++  return (new FlashFontFileResource(GetConnection(), instance, description,
++                                     charset))->GetReference();
++}
++
++PP_Resource ResourceCreationProxy::CreateFlashMenu(
++    PP_Instance instance,
++    const PP_Flash_Menu* menu_data) {
++  return (new FlashMenuResource(GetConnection(), instance))->GetReference();
++}
++
++PP_Resource ResourceCreationProxy::CreateFlashMessageLoop(
++    PP_Instance instance) {
++  return PPB_Flash_MessageLoop_Proxy::CreateProxyResource(instance);
++}
++
+ PP_Resource ResourceCreationProxy::CreateVideoDecoderDev(
+     PP_Instance instance,
+     PP_Resource context3d_id,
+diff --git a/ppapi/proxy/resource_creation_proxy.h b/ppapi/proxy/resource_creation_proxy.h
+index dcda14a144ca3..2e6c4ce43df6a 100644
+--- a/ppapi/proxy/resource_creation_proxy.h
++++ b/ppapi/proxy/resource_creation_proxy.h
+@@ -163,6 +163,14 @@ class ResourceCreationProxy : public InterfaceProxy,
+       const PP_BrowserFont_Trusted_Description* description) override;
+   PP_Resource CreateBuffer(PP_Instance instance, uint32_t size) override;
+   PP_Resource CreateVideoCapture(PP_Instance instance) override;
++  PP_Resource CreateFlashDRM(PP_Instance instance) override;
++  PP_Resource CreateFlashFontFile(
++      PP_Instance instance,
++      const PP_BrowserFont_Trusted_Description* description,
++      PP_PrivateFontCharset charset) override;
++  PP_Resource CreateFlashMenu(PP_Instance instance,
++                              const PP_Flash_Menu* menu_data) override;
++  PP_Resource CreateFlashMessageLoop(PP_Instance instance) override;
+   PP_Resource CreateVideoDecoderDev(
+       PP_Instance instance,
+       PP_Resource context3d_id,
+diff --git a/ppapi/proxy/serialized_structs.cc b/ppapi/proxy/serialized_structs.cc
+index 29c8a23c75039..7c0ef42c0f8ee 100644
+--- a/ppapi/proxy/serialized_structs.cc
++++ b/ppapi/proxy/serialized_structs.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "ppapi/proxy/serialized_structs.h"
+ 
++#include <cstring>
++
+ #include "base/pickle.h"
+ #include "build/build_config.h"
+ #include "ppapi/c/pp_file_info.h"
+@@ -61,5 +63,14 @@ SerializedNetworkInfo::SerializedNetworkInfo()
+ 
+ SerializedNetworkInfo::~SerializedNetworkInfo() {}
+ 
++PPBFlash_DrawGlyphs_Params::PPBFlash_DrawGlyphs_Params()
++    : instance(0), color(0), allow_subpixel_aa(PP_FALSE) {
++  memset(&position, 0, sizeof(position));
++  memset(&clip, 0, sizeof(clip));
++  memset(transformation, 0, sizeof(transformation));
++}
++
++PPBFlash_DrawGlyphs_Params::~PPBFlash_DrawGlyphs_Params() = default;
++
+ }  // namespace proxy
+ }  // namespace ppapi
+diff --git a/ppapi/proxy/serialized_structs.h b/ppapi/proxy/serialized_structs.h
+index eb08026aff8a7..00e25dc9b509e 100644
+--- a/ppapi/proxy/serialized_structs.h
++++ b/ppapi/proxy/serialized_structs.h
+@@ -66,6 +66,22 @@ struct SerializedDirEntry {
+   bool is_dir;
+ };
+ 
++struct PPAPI_PROXY_EXPORT PPBFlash_DrawGlyphs_Params {
++  PPBFlash_DrawGlyphs_Params();
++  ~PPBFlash_DrawGlyphs_Params();
++
++  PP_Instance instance;
++  ppapi::HostResource image_data;
++  SerializedFontDescription font_desc;
++  uint32_t color;
++  PP_Point position;
++  PP_Rect clip;
++  float transformation[3][3];
++  PP_Bool allow_subpixel_aa;
++  std::vector<uint16_t> glyph_indices;
++  std::vector<PP_Point> glyph_advances;
++};
++
+ struct PPBURLLoader_UpdateProgress_Params {
+   PP_Instance instance;
+   ppapi::HostResource resource;
+diff --git a/ppapi/shared_impl/BUILD.gn b/ppapi/shared_impl/BUILD.gn
+index d6efdcc516991..e18fb6a88943e 100644
+--- a/ppapi/shared_impl/BUILD.gn
++++ b/ppapi/shared_impl/BUILD.gn
+@@ -128,6 +128,10 @@ component("shared_impl") {
+     "file_io_state_manager.h",
+     "file_path.cc",
+     "file_path.h",
++    "flash_clipboard_format_registry.cc",
++    "flash_clipboard_format_registry.h",
++    "ppb_flash_font_file_shared.h",
++    "ppp_flash_browser_operations_shared.h",
+     "file_ref_util.cc",
+     "file_ref_util.h",
+     "file_system_util.cc",
+diff --git a/ppapi/shared_impl/api_id.h b/ppapi/shared_impl/api_id.h
+index 9728db62e1f7e..721e14fc7881b 100644
+--- a/ppapi/shared_impl/api_id.h
++++ b/ppapi/shared_impl/api_id.h
+@@ -36,6 +36,7 @@ enum ApiID {
+   API_ID_PPP_TEXT_INPUT,
+   API_ID_PPP_VIDEO_DECODER_DEV,
+   API_ID_RESOURCE_CREATION,
++  API_ID_PPB_FLASH_MESSAGELOOP,
+ 
+   // Must be last to indicate the number of interface IDs.
+   API_ID_COUNT
+diff --git a/ppapi/shared_impl/resource.h b/ppapi/shared_impl/resource.h
+index d9b74292e0ebc..236c7028baaa6 100644
+--- a/ppapi/shared_impl/resource.h
++++ b/ppapi/shared_impl/resource.h
+@@ -35,6 +35,14 @@
+   F(PPB_FileIO_API)                     \
+   F(PPB_FileRef_API)                    \
+   F(PPB_FileSystem_API)                 \
++  F(PPB_Flash_Clipboard_API)            \
++  F(PPB_Flash_DRM_API)                  \
++  F(PPB_Flash_File_API)                 \
++  F(PPB_Flash_FontFile_API)             \
++  F(PPB_Flash_Fullscreen_API)           \
++  F(PPB_Flash_Functions_API)            \
++  F(PPB_Flash_Menu_API)                 \
++  F(PPB_Flash_MessageLoop_API)          \
+   F(PPB_Gamepad_API)                    \
+   F(PPB_Graphics2D_API)                 \
+   F(PPB_Graphics3D_API)                 \
+diff --git a/ppapi/shared_impl/singleton_resource_id.h b/ppapi/shared_impl/singleton_resource_id.h
+index 3ded9e62c65ae..a1c4a12781bdd 100644
+--- a/ppapi/shared_impl/singleton_resource_id.h
++++ b/ppapi/shared_impl/singleton_resource_id.h
+@@ -11,6 +11,10 @@ namespace ppapi {
+ // PPB_Instance_API.GetSingletonResource.
+ enum SingletonResourceID {
+   BROWSER_FONT_SINGLETON_ID,
++  FLASH_CLIPBOARD_SINGLETON_ID,
++  FLASH_FILE_SINGLETON_ID,
++  FLASH_FULLSCREEN_SINGLETON_ID,
++  FLASH_SINGLETON_ID,
+   GAMEPAD_SINGLETON_ID,
+   ISOLATED_FILESYSTEM_SINGLETON_ID,
+   NETWORK_PROXY_SINGLETON_ID,
+diff --git a/ppapi/thunk/BUILD.gn b/ppapi/thunk/BUILD.gn
+index 87d788d5cbd97..5b116962e507a 100644
+--- a/ppapi/thunk/BUILD.gn
++++ b/ppapi/thunk/BUILD.gn
+@@ -72,6 +72,24 @@ source_set("thunk") {
+     "ppb_file_io_thunk.cc",
+     "ppb_file_ref_api.h",
+     "ppb_file_ref_thunk.cc",
++    "ppb_flash_clipboard_api.h",
++    "ppb_flash_clipboard_thunk.cc",
++    "ppb_flash_drm_api.h",
++    "ppb_flash_drm_thunk.cc",
++    "ppb_flash_file_api.h",
++    "ppb_flash_file_fileref_thunk.cc",
++    "ppb_flash_file_modulelocal_thunk.cc",
++    "ppb_flash_font_file_api.h",
++    "ppb_flash_font_file_thunk.cc",
++    "ppb_flash_fullscreen_api.h",
++    "ppb_flash_fullscreen_thunk.cc",
++    "ppb_flash_functions_api.h",
++    "ppb_flash_menu_api.h",
++    "ppb_flash_menu_thunk.cc",
++    "ppb_flash_message_loop_api.h",
++    "ppb_flash_message_loop_thunk.cc",
++    "ppb_flash_print_thunk.cc",
++    "ppb_flash_thunk.cc",
+     "ppb_file_system_api.h",
+     "ppb_file_system_thunk.cc",
+     "ppb_fullscreen_thunk.cc",
+diff --git a/ppapi/thunk/interfaces_ppb_private.h b/ppapi/thunk/interfaces_ppb_private.h
+index b79bbe7e5c829..678acd33e4d23 100644
+--- a/ppapi/thunk/interfaces_ppb_private.h
++++ b/ppapi/thunk/interfaces_ppb_private.h
+@@ -10,6 +10,15 @@
+ #include "build/build_config.h"
+ #include "ppapi/thunk/interfaces_preamble.h"
+ 
++#include "ppapi/c/private/ppb_flash.h"
++#include "ppapi/c/private/ppb_flash_clipboard.h"
++#include "ppapi/c/private/ppb_flash_file.h"
++#include "ppapi/c/private/ppb_flash_font_file.h"
++#include "ppapi/c/private/ppb_flash_fullscreen.h"
++#include "ppapi/c/private/ppb_flash_menu.h"
++#include "ppapi/c/private/ppb_flash_print.h"
++#include "ppapi/c/private/ppb_flash_drm.h"
++
+ // See interfaces_ppb_private_no_permissions.h for other private interfaces.
+ 
+ PROXIED_API(PPB_X509Certificate_Private)
+@@ -27,6 +36,38 @@ PROXIED_IFACE(PPB_FILECHOOSER_TRUSTED_INTERFACE_0_6,
+               PPB_FileChooserTrusted_0_6)
+ PROXIED_IFACE(PPB_FILEREFPRIVATE_INTERFACE_0_1,
+               PPB_FileRefPrivate_0_1)
++
++// Flash interfaces (restored from Chrome 87 for PPAPI Flash support)
++PROXIED_IFACE(PPB_FLASH_CLIPBOARD_INTERFACE_4_0,
++              PPB_Flash_Clipboard_4_0)
++PROXIED_IFACE(PPB_FLASH_CLIPBOARD_INTERFACE_5_0,
++              PPB_Flash_Clipboard_5_0)
++PROXIED_IFACE(PPB_FLASH_CLIPBOARD_INTERFACE_5_1,
++              PPB_Flash_Clipboard_5_1)
++PROXIED_IFACE(PPB_FLASH_FILE_FILEREF_INTERFACE,
++              PPB_Flash_File_FileRef)
++PROXIED_IFACE(PPB_FLASH_FILE_MODULELOCAL_INTERFACE,
++              PPB_Flash_File_ModuleLocal_3_0)
++PROXIED_IFACE(PPB_FLASH_FONTFILE_INTERFACE_0_1,
++              PPB_Flash_FontFile_0_1)
++PROXIED_IFACE(PPB_FLASH_FONTFILE_INTERFACE_0_2,
++              PPB_Flash_FontFile_0_2)
++PROXIED_IFACE(PPB_FLASHFULLSCREEN_INTERFACE_1_0,
++              PPB_FlashFullscreen_1_0)
++PROXIED_IFACE(PPB_FLASH_INTERFACE_12_4,
++              PPB_Flash_12_4)
++PROXIED_IFACE(PPB_FLASH_INTERFACE_12_5,
++              PPB_Flash_12_5)
++PROXIED_IFACE(PPB_FLASH_INTERFACE_12_6,
++              PPB_Flash_12_6)
++PROXIED_IFACE(PPB_FLASH_INTERFACE_13_0,
++              PPB_Flash_13_0)
++PROXIED_IFACE(PPB_FLASH_MENU_INTERFACE_0_2,
++              PPB_Flash_Menu_0_2)
++PROXIED_IFACE(PPB_FLASH_PRINT_INTERFACE_1_0,
++              PPB_Flash_Print_1_0)
++PROXIED_IFACE(PPB_FLASH_DRM_INTERFACE_1_1,
++              PPB_Flash_DRM_1_1)
+ #endif  // !BUILDFLAG(IS_NACL)
+ 
+ #include "ppapi/thunk/interfaces_postamble.h"
+diff --git a/ppapi/thunk/resource_creation_api.h b/ppapi/thunk/resource_creation_api.h
+index 61b0e0381e550..18ab8f3db7779 100644
+--- a/ppapi/thunk/resource_creation_api.h
++++ b/ppapi/thunk/resource_creation_api.h
+@@ -32,6 +32,7 @@
+ #endif
+ 
+ struct PP_BrowserFont_Trusted_Description;
++struct PP_Flash_Menu;
+ struct PP_NetAddress_IPv4;
+ struct PP_NetAddress_IPv6;
+ struct PP_NetAddress_Private;
+@@ -185,6 +186,14 @@ class ResourceCreationAPI {
+       const PP_BrowserFont_Trusted_Description* description) = 0;
+   virtual PP_Resource CreateBuffer(PP_Instance instance, uint32_t size) = 0;
+   virtual PP_Resource CreateVideoCapture(PP_Instance instance) = 0;
++  virtual PP_Resource CreateFlashDRM(PP_Instance instance) = 0;
++  virtual PP_Resource CreateFlashFontFile(
++      PP_Instance instance,
++      const PP_BrowserFont_Trusted_Description* description,
++      PP_PrivateFontCharset charset) = 0;
++  virtual PP_Resource CreateFlashMenu(PP_Instance instance,
++                                      const PP_Flash_Menu* menu_data) = 0;
++  virtual PP_Resource CreateFlashMessageLoop(PP_Instance instance) = 0;
+   virtual PP_Resource CreateVideoDecoderDev(
+       PP_Instance instance,
+       PP_Resource context3d_id,
+diff --git a/testing/scripts/common.py b/testing/scripts/common.py
+index 448c438dc9927..e095ec5ad12c0 100644
+--- a/testing/scripts/common.py
++++ b/testing/scripts/common.py
+@@ -67,7 +67,8 @@ def set_lpac_acls(acl_dir, is_test_script=False):
+   try:
+     existing_acls = subprocess.check_output(['icacls', acl_dir],
+                                             stderr=subprocess.STDOUT,
+-                                            universal_newlines=True)
++                                            encoding='utf-8',
++                                            errors='replace')
+   except subprocess.CalledProcessError as e:
+     logging.error('Failed to retrieve existing ACLs for directory %s', acl_dir)
+     logging.error('Command output: %s', e.output)
