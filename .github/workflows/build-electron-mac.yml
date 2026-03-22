@@ -110,6 +110,14 @@ jobs:
       - name: GN gen
         working-directory: /tmp/electron-build/src
         run: |
+          # Ajouter gn et ninja au PATH
+          export PATH="$PWD/buildtools/mac:$PWD/third_party/ninja:$PWD/buildtools:$PATH"
+          # gn peut aussi être dans depot_tools sous le nom gn.py, vérifier
+          echo "=== gn location ==="
+          which gn || echo "gn not in PATH, trying buildtools/mac/gn"
+          ls buildtools/mac/gn 2>/dev/null || ls buildtools/gn 2>/dev/null || echo "searching..."
+          find buildtools -name "gn" -type f 2>/dev/null | head -5
+
           GN_ARGS='import("//electron/build/args/release.gn") enable_ppapi = true enable_plugins = true target_cpu = "${{ inputs.target_arch }}"'
 
           if [ "${{ inputs.target_arch }}" = "x64" ]; then
@@ -117,7 +125,8 @@ jobs:
           fi
 
           echo "GN args: $GN_ARGS"
-          gn gen out/Release --args="$GN_ARGS"
+          # Utiliser le wrapper gn de buildtools ou depot_tools
+          buildtools/mac/gn gen out/Release --args="$GN_ARGS" || gn gen out/Release --args="$GN_ARGS"
 
       # ── 7. Compiler ──
       - name: Build Electron
