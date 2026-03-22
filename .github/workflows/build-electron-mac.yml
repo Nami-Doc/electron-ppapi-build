@@ -1,6 +1,5 @@
 name: Build Electron macOS (PPAPI Flash)
 
-# Déclenché manuellement depuis l'onglet Actions
 on:
   workflow_dispatch:
     inputs:
@@ -20,34 +19,56 @@ on:
 jobs:
   build:
     name: Electron macOS ${{ inputs.target_arch }}
-    # arm64 → macos-14 (M1), x64 → macos-13 (Intel)
-    runs-on: ${{ inputs.target_arch == 'arm64' && 'macos-14' || 'macos-13' }}
+    # macos-15 obligatoire — Xcode 16 requis pour macOS 15 SDK (kVK_ContextualMenu etc.)
+    runs-on: ${{ inputs.target_arch == 'arm64' && 'macos-15' || 'macos-15' }}
     timeout-minutes: 360
     env:
       BUILD_DIR: /tmp/electron-build
 
     steps:
-      # ── 1. Libérer de l'espace disque ──
+      # ── 1. Libérer de l'espace disque (agressif) ──
       - name: Free disk space
         run: |
           echo "=== Disk BEFORE cleanup ==="
           df -h /
+          # Supprimer tout sauf le Xcode le plus récent
+          ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | head -n -1 | xargs -I{} sudo rm -rf {} || true
+          # Supprimer les outils inutiles
           sudo rm -rf /usr/local/lib/android || true
           sudo rm -rf /usr/local/share/powershell || true
           sudo rm -rf /usr/local/.ghcup || true
           sudo rm -rf /opt/hostedtoolcache || true
-          ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | head -n -1 | xargs -I{} sudo rm -rf {} || true
+          sudo rm -rf /usr/local/share/dotnet || true
+          sudo rm -rf /usr/local/share/vcpkg || true
+          sudo rm -rf /usr/local/opt/pipx || true
+          sudo rm -rf /Library/Developer/CoreSimulator || true
           brew cleanup --prune=all 2>/dev/null || true
           echo "=== Disk AFTER cleanup ==="
           df -h /
 
-      # ── 2. Installer depot_tools ──
+      # ── 2. Sélectionner Xcode 16 (macOS 15 SDK) ──
+      - name: Select Xcode 16
+        run: |
+          echo "=== Available Xcode versions ==="
+          ls -d /Applications/Xcode*.app 2>/dev/null
+          # Prendre le Xcode 16.x le plus récent
+          XCODE=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$XCODE" ]; then
+            XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          fi
+          echo "Using: $XCODE"
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+          xcrun --show-sdk-path
+          xcrun --show-sdk-version
+
+      # ── 3. Installer depot_tools ──
       - name: Install depot_tools
         run: |
           git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $HOME/depot_tools
           echo "$HOME/depot_tools" >> $GITHUB_PATH
 
-      # ── 3. Configurer gclient (PAS d'indentation avant solutions !) ──
+      # ── 4. Configurer gclient ──
       - name: Configure gclient
         run: |
           mkdir -p $BUILD_DIR && cd $BUILD_DIR
@@ -65,16 +86,14 @@ jobs:
             },
           ]
           EOF
-          # Supprimer l'indentation du heredoc (gclient = Python, sensible à l'indentation)
           sed -i '' 's/^          //' $BUILD_DIR/.gclient
           echo "--- .gclient ---"
           cat .gclient
 
-      # ── 4. Synchroniser Chromium + Electron ──
+      # ── 5. Synchroniser Chromium + Electron ──
       - name: Sync sources (gclient)
         working-directory: /tmp/electron-build
         run: |
-          # --no-history = shallow clone pour économiser du disque
           gclient sync --with_branch_heads --with_tags --no-history --nohooks -v 2>&1 | tail -200
           echo ""
           echo "=== Running hooks ==="
@@ -87,52 +106,37 @@ jobs:
           ls src/electron/ | head -10
         timeout-minutes: 180
 
-      # ── 4b. Checkout du patch depuis ce repo ──
+      # ── 6. Checkout du patch depuis ce repo ──
       - name: Checkout patch file
         uses: actions/checkout@v4
         with:
           path: _repo
 
-      # ── 5. Appliquer le patch PPAPI Flash complet ──
+      # ── 7. Appliquer le patch PPAPI Flash complet ──
       - name: Apply PPAPI Flash patch
         working-directory: /tmp/electron-build/src
         run: |
           echo "=== Extracting PPAPI Flash source files (42 files) ==="
           tar -xzf $GITHUB_WORKSPACE/_repo/ppapi-flash-sources.tar.gz
-          echo "=== Extracted files ==="
-          ls ppapi/thunk/ppb_flash_* | head -10
-          ls ppapi/proxy/flash_* | head -10
+          ls ppapi/thunk/ppb_flash_* | wc -l
+          ls ppapi/proxy/flash_* | wc -l
 
-          echo ""
-          echo "=== Applying patch (modifications to existing files) ==="
+          echo "=== Applying patch ==="
           git apply --stat $GITHUB_WORKSPACE/_repo/ppapi-flash-full.patch
           git apply $GITHUB_WORKSPACE/_repo/ppapi-flash-full.patch
 
-          echo ""
-          echo "=== Patch applied successfully ==="
           echo "=== Verify allowlist ==="
           grep -n -A7 "kMimeTypeAllowlist" content/common/pepper_plugin_list.cc
 
-      # ── 5b. Générer packed-refs (manquant avec --no-history) ──
+      # ── 8. Fix git packed-refs (manquant avec --no-history) ──
       - name: Fix git packed-refs
         working-directory: /tmp/electron-build/src/electron
-        run: |
-          git pack-refs --all
-          ls -la .git/packed-refs
-          head -5 .git/packed-refs
+        run: git pack-refs --all
 
-      # ── 6. GN gen ──
+      # ── 9. GN gen ──
       - name: GN gen
         working-directory: /tmp/electron-build/src
         run: |
-          # Ajouter gn et ninja au PATH
-          export PATH="$PWD/buildtools/mac:$PWD/third_party/ninja:$PWD/buildtools:$PATH"
-          # gn peut aussi être dans depot_tools sous le nom gn.py, vérifier
-          echo "=== gn location ==="
-          which gn || echo "gn not in PATH, trying buildtools/mac/gn"
-          ls buildtools/mac/gn 2>/dev/null || ls buildtools/gn 2>/dev/null || echo "searching..."
-          find buildtools -name "gn" -type f 2>/dev/null | head -5
-
           GN_ARGS='import("//electron/build/args/release.gn") enable_ppapi = true enable_plugins = true target_cpu = "${{ inputs.target_arch }}"'
 
           if [ "${{ inputs.target_arch }}" = "x64" ]; then
@@ -140,28 +144,30 @@ jobs:
           fi
 
           echo "GN args: $GN_ARGS"
-          # Utiliser le wrapper gn de buildtools ou depot_tools
-          buildtools/mac/gn gen out/Release --args="$GN_ARGS" || gn gen out/Release --args="$GN_ARGS"
+          buildtools/mac/gn gen out/Release --args="$GN_ARGS"
 
-      # ── 7. Compiler ──
+      # ── 10. Compiler ──
       - name: Build Electron
         working-directory: /tmp/electron-build/src
         run: |
+          echo "=== Xcode version ==="
+          xcodebuild -version
           echo "=== Starting build ==="
+          df -h /
           autoninja -C out/Release electron
           echo "=== Build complete! ==="
           ls -lh out/Release/Electron.app/Contents/MacOS/Electron || echo "Electron.app not found"
           df -h /
         timeout-minutes: 300
 
-      # ── 8. Packager ──
+      # ── 11. Packager ──
       - name: Package Electron.app
         working-directory: /tmp/electron-build/src/out/Release
         run: |
           tar -czf /tmp/electron-mac-${{ inputs.target_arch }}.tar.gz Electron.app/
           ls -lh /tmp/electron-mac-${{ inputs.target_arch }}.tar.gz
 
-      # ── 9. Upload artifact ──
+      # ── 12. Upload artifact ──
       - name: Upload Electron.app artifact
         uses: actions/upload-artifact@v4
         with:
