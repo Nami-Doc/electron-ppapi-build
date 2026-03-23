@@ -74,21 +74,7 @@ jobs:
           name: Configure gclient
           command: |
             mkdir -p $BUILD_DIR && cd $BUILD_DIR
-            cat > .gclient << 'GCLIENT_EOF'
-            solutions = [
-              {
-                "name": "src/electron",
-                "url": "https://github.com/electron/electron@<< pipeline.parameters.electron_ref >>",
-                "deps_file": "DEPS",
-                "managed": False,
-                "custom_vars": {
-                  "checkout_mac": True,
-                  "host_os": "mac",
-                },
-              },
-            ]
-            GCLIENT_EOF
-            sed -i '' 's/^            //' $BUILD_DIR/.gclient
+            printf 'solutions = [\n  {\n    "name": "src/electron",\n    "url": "https://github.com/electron/electron@%s",\n    "deps_file": "DEPS",\n    "managed": False,\n    "custom_vars": {\n      "checkout_mac": True,\n      "host_os": "mac",\n    },\n  },\n]\n' "<< pipeline.parameters.electron_ref >>" > .gclient
             echo "--- .gclient ---"
             cat $BUILD_DIR/.gclient
 
