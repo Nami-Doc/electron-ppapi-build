@@ -20,7 +20,7 @@ jobs:
   build:
     name: Electron macOS ${{ inputs.target_arch }}
     # macos-15 obligatoire — Xcode 16 requis pour macOS 15 SDK (kVK_ContextualMenu etc.)
-    runs-on: macos-15
+    runs-on: macos-15-large
     timeout-minutes: 360
     env:
       BUILD_DIR: /tmp/electron-build
