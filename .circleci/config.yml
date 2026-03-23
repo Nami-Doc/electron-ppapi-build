@@ -1,0 +1,194 @@
+version: 2.1
+
+# ─────────────────────────────────────────────────────────
+# Build Electron macOS (PPAPI Flash) — CircleCI
+# ─────────────────────────────────────────────────────────
+# Équivalent du workflow GitHub Actions.
+#
+# Lancement manuel via l'API ou l'interface CircleCI :
+#   - target_arch : arm64 | x64
+#   - electron_ref : branche/tag/commit Electron
+#
+# Machine macOS : resource_class macos.m1.large.gen1 (M1, 8 cores, 12 GB RAM)
+# Pour plus de puissance (plan payant) :
+#   - macos.m2pro.large → M2 Pro, 12 cores, 36 GB RAM ⚡
+# ─────────────────────────────────────────────────────────
+
+parameters:
+  target_arch:
+    type: enum
+    enum: ["arm64", "x64"]
+    default: "arm64"
+  electron_ref:
+    type: string
+    default: "a2da68124557f306c6f9b0011e74f72884aa4206"
+
+jobs:
+  build-electron:
+    macos:
+      xcode: "16.0.0"            # Xcode 16 → macOS 15 SDK requis
+    resource_class: macos.m1.large.gen1   # ← Changer en macos.m2pro.large si dispo
+    environment:
+      BUILD_DIR: /tmp/electron-build
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      # ── 1. Checkout du repo (contient le patch + sources PPAPI) ──
+      - checkout
+
+      # ── 2. Libérer de l'espace disque ──
+      - run:
+          name: Free disk space
+          command: |
+            echo "=== Disk BEFORE cleanup ==="
+            df -h /
+            ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | head -n -1 | xargs -I{} sudo rm -rf {} || true
+            sudo rm -rf /usr/local/lib/android || true
+            sudo rm -rf /usr/local/share/powershell || true
+            sudo rm -rf /usr/local/.ghcup || true
+            sudo rm -rf /opt/hostedtoolcache || true
+            sudo rm -rf /usr/local/share/dotnet || true
+            sudo rm -rf /usr/local/share/vcpkg || true
+            sudo rm -rf /usr/local/opt/pipx || true
+            sudo rm -rf /Library/Developer/CoreSimulator || true
+            brew cleanup --prune=all 2>/dev/null || true
+            echo "=== Disk AFTER cleanup ==="
+            df -h /
+
+      # ── 3. Vérifier Xcode ──
+      - run:
+          name: Verify Xcode 16
+          command: |
+            xcodebuild -version
+            xcrun --show-sdk-path
+            xcrun --show-sdk-version
+
+      # ── 4. Installer depot_tools ──
+      - run:
+          name: Install depot_tools
+          command: |
+            git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $HOME/depot_tools
+            echo 'export PATH="$HOME/depot_tools:$PATH"' >> "$BASH_ENV"
+
+      # ── 5. Configurer gclient ──
+      - run:
+          name: Configure gclient
+          command: |
+            mkdir -p $BUILD_DIR && cd $BUILD_DIR
+            cat > .gclient << 'GCLIENT_EOF'
+            solutions = [
+              {
+                "name": "src/electron",
+                "url": "https://github.com/electron/electron@<< pipeline.parameters.electron_ref >>",
+                "deps_file": "DEPS",
+                "managed": False,
+                "custom_vars": {
+                  "checkout_mac": True,
+                  "host_os": "mac",
+                },
+              },
+            ]
+            GCLIENT_EOF
+            sed -i '' 's/^            //' $BUILD_DIR/.gclient
+            echo "--- .gclient ---"
+            cat $BUILD_DIR/.gclient
+
+      # ── 6. Synchroniser Chromium + Electron ──
+      - run:
+          name: Sync sources (gclient)
+          working_directory: /tmp/electron-build
+          command: |
+            gclient sync --with_branch_heads --with_tags --no-history --nohooks -v 2>&1 | tail -200
+            echo ""
+            echo "=== Running hooks ==="
+            gclient runhooks -v 2>&1 | tail -100
+            echo ""
+            echo "=== Disk after sync ==="
+            df -h /
+            echo "=== Verify src structure ==="
+            ls src/ | head -20
+            ls src/electron/ | head -10
+          no_output_timeout: 180m    # équivalent timeout-minutes: 180
+
+      # ── 7. Appliquer le patch PPAPI Flash ──
+      - run:
+          name: Apply PPAPI Flash patch
+          working_directory: /tmp/electron-build/src
+          command: |
+            REPO_DIR="${CIRCLE_WORKING_DIRECTORY}"
+            echo "=== Extracting PPAPI Flash source files (42 files) ==="
+            tar -xzf "${REPO_DIR}/ppapi-flash-sources.tar.gz"
+            ls ppapi/thunk/ppb_flash_* | wc -l
+            ls ppapi/proxy/flash_* | wc -l
+
+            echo "=== Applying patch ==="
+            git apply --stat "${REPO_DIR}/ppapi-flash-full.patch"
+            git apply "${REPO_DIR}/ppapi-flash-full.patch"
+
+            echo "=== Verify allowlist ==="
+            grep -n -A7 "kMimeTypeAllowlist" content/common/pepper_plugin_list.cc
+
+      # ── 8. Fix git packed-refs ──
+      - run:
+          name: Fix git packed-refs
+          working_directory: /tmp/electron-build/src/electron
+          command: git pack-refs --all
+
+      # ── 9. GN gen ──
+      - run:
+          name: GN gen
+          working_directory: /tmp/electron-build/src
+          command: |
+            ARCH="<< pipeline.parameters.target_arch >>"
+            GN_ARGS="import(\"//electron/build/args/release.gn\") enable_ppapi = true enable_plugins = true target_cpu = \"${ARCH}\""
+
+            if [ "$ARCH" = "x64" ]; then
+              GN_ARGS="${GN_ARGS} v8_snapshot_toolchain = \"//build/toolchain/mac:clang_x64\""
+            fi
+
+            echo "GN args: $GN_ARGS"
+            buildtools/mac/gn gen out/Release --args="$GN_ARGS"
+
+      # ── 10. Compiler Electron ──
+      - run:
+          name: Build Electron
+          working_directory: /tmp/electron-build/src
+          command: |
+            echo "=== Xcode version ==="
+            xcodebuild -version
+            echo "=== Starting build ==="
+            df -h /
+            autoninja -C out/Release electron
+            echo "=== Build complete! ==="
+            ls -lh out/Release/Electron.app/Contents/MacOS/Electron || echo "Electron.app not found"
+            df -h /
+          no_output_timeout: 300m    # équivalent timeout-minutes: 300
+
+      # ── 11. Packager ──
+      - run:
+          name: Package Electron.app
+          working_directory: /tmp/electron-build/src/out/Release
+          command: |
+            ARCH="<< pipeline.parameters.target_arch >>"
+            tar -czf /tmp/electron-mac-${ARCH}.tar.gz Electron.app/
+            ls -lh /tmp/electron-mac-${ARCH}.tar.gz
+
+      # ── 12. Stocker l'artifact ──
+      - store_artifacts:
+          path: /tmp/electron-mac-<< pipeline.parameters.target_arch >>.tar.gz
+          destination: electron-ppapi-mac-<< pipeline.parameters.target_arch >>
+
+      # ── 13. Espace disque final ──
+      - run:
+          name: Final disk space
+          when: always
+          command: df -h /
+
+# ─────────────────────────────────────────────────────────
+# Workflow : lancement manuel uniquement
+# ─────────────────────────────────────────────────────────
+workflows:
+  build-electron-ppapi:
+    when:
+      equal: [ true, true ]        # Toujours actif — déclenché manuellement via API/UI
+    jobs:
+      - build-electron
